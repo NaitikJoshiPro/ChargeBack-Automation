@@ -33,8 +33,6 @@ For technical documentation or workflow access requests, please contact:
 
 ---
 
----
-
 ## License
 
 Copyright © 2025 Naitik Joshi, Chargeback Automation Team.  
