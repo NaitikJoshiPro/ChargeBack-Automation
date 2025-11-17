@@ -1,0 +1,1361 @@
+{
+  "name": "Chargeback_Automation_n8n_Types",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "path": "chargeback",
+        "options": {
+          "responseMode": "onReceived",
+          "responseCode": 200,
+          "responseData": "={{{ $json }}}",
+          "rawBody": true
+        }
+      },
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        200,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "/* Keep raw incoming item for auditing and downstream processing */\nitems[0].json._receivedAt = new Date().toISOString();\nitems[0].json._rawBody = items[0].json.body || items[0].json;\nreturn items;"
+      },
+      "name": "Case",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        420,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "sheetId": "",
+        "range": "cases!A:Z",
+        "options": {
+          "valueInputMode": "USER_ENTERED"
+        },
+        "rawData": "={{{ [ [ new Date().toISOString(), $json._rawBody ? JSON.stringify($json._rawBody) : JSON.stringify($json) ] ] }}}"
+      },
+      "name": "SheetsCases",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 1,
+      "position": [
+        620,
+        120
+      ],
+      "credentials": {
+        "googleSheetsOAuth2": {
+          "id": "GOOGLE_SHEETS_OAUTH2_PLACEHOLDER",
+          "name": "GoogleSheetsCreds"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "/* Signature verification (HMAC SHA256). If header exists, verify. Use environment variable HMAC_SECRET (set on n8n host). */\nconst payload = $json._rawBody || $json;\nconst headers = $json.headers || {};\nconst sigHeader = headers['x-signature'] || headers['X-Signature'] || headers['signature'];\nconst crypto = require('crypto');\nconst secret = process.env.HMAC_SECRET || 'HMAC_SECRET_PLACEHOLDER';\nif (!sigHeader) { $json._sigVerified = false; return items; }\nlet computed;\ntry{\n  computed = crypto.createHmac('sha256', secret).update(typeof payload === 'string' ? payload : JSON.stringify(payload)).digest('hex');\n}catch(e){ $json._sigVerified = false; $json._sigError = e.message; return items; }\n$json._sigVerified = (computed === sigHeader);\nif (!$json._sigVerified) $json._sigError = 'signature_mismatch';\nreturn items;"
+      },
+      "name": "Signature",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        420,
+        340
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "/* PII scrub: mask common PII keys from _rawBody for storage/logging. Saves a redacted copy _redacted. */\nconst raw = JSON.parse(JSON.stringify($json._rawBody || $json));\nfunction deepMask(obj){\n  if (Array.isArray(obj)) return obj.map(deepMask);\n  if (obj && typeof obj === 'object'){\n    const out = {};\n    for (const k of Object.keys(obj)){\n      const v = obj[k];\n      const kl = k.toLowerCase();\n      if (['cardnumber','card_number','card','pan','number','cvv','ssn','social','dob','birthdate','email','phone','phone_number'].includes(kl) || /password|token|secret|cvv|ssn/.test(kl)){\n        out[k] = 'REDACTED';\n      } else {\n        out[k] = deepMask(v);\n      }\n    }\n    return out;\n  }\n  return obj;\n}\n$json._redacted = deepMask(raw);\nreturn items;"
+      },
+      "name": "Scrub",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        640,
+        340
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "/* Basic schema validation. Lists missing required fields in _schemaMissing and sets _schemaValid boolean. Customize required[] for your PSP schema. */\nconst raw = $json._rawBody || $json;\nconst required = ['caseId','txnId','merchantId','amount','currency','disputeReason'];\nconst missing = [];\nfor (const r of required){ if (!raw[r] && !(raw.data && raw.data[r])) missing.push(r); }\n$json._schemaMissing = missing;\n$json._schemaValid = missing.length === 0;\nreturn items;"
+      },
+      "name": "Validate",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        860,
+        340
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "/* Normalize inbound payload to canonical shape. Produces normalized object under normalized. */\nconst raw = $json._rawBody || $json;\nfunction get(o,p){ return p.reduce((a,k)=>a && a[k], o); }\nconst normalized = {\n  caseId: raw.caseId || raw.id || get(raw,['data','case','id']) || ('case_'+Date.now()),\n  txnId: raw.txnId || raw.transactionId || get(raw,['transaction','id']) || null,\n  merchantId: raw.merchantId || raw.merchant || get(raw,['merchant','id']) || null,\n  amount: raw.amount || get(raw,['transaction','amount']) || 0,\n  currency: raw.currency || raw.curr || get(raw,['transaction','currency']) || 'USD',\n  disputeReason: raw.disputeReason || raw.reason || get(raw,['dispute','reason']) || 'unknown',\n  evidenceRefs: raw.evidenceRefs || raw.evidence || get(raw,['evidence','items']) || [],\n  timestamps: raw.timestamps || { received: new Date().toISOString() },\n  customer: raw.customer || raw.customerInfo || raw.payer || {},\n  reservationId: raw.reservationId || raw.bookingId || get(raw,['reservation','id']) || null,\n  policyUrl: raw.policyUrl || null,\n  raw: raw\n};\n$json.normalized = normalized;\nreturn items;"
+      },
+      "name": "Normalize",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        1100,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "/* Prepare transaction DB HTTP request (placeholder endpoint). */\nconst txn = $json.normalized.txnId || '';\nconst req = { method: 'GET', url: `https://example-internal-txdb.local/transactions/${encodeURIComponent(txn)}`, headers: { 'Authorization': 'Bearer INTERNAL_API_KEY_PLACEHOLDER' } };\nreturn [{ json: { txRequest: req } }];"
+      },
+      "name": "Transaction",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        1320,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.txRequest.url }}",
+        "method": "GET",
+        "responseFormat": "json",
+        "headerParametersJson": "{\"Authorization\":\"Bearer INTERNAL_API_KEY_PLACEHOLDER\"}"
+      },
+      "name": "TxHTTP",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [
+        1540,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "/* Prepare evidence HTTP calls: create array of fetch calls for each evidenceRef. Evidence refs may be IDs or URLs. */\nconst refs = Array.isArray($json.normalized.evidenceRefs) ? $json.normalized.evidenceRefs : ($json.normalized.evidenceRefs ? [$json.normalized.evidenceRefs] : []);\nconst calls = refs.map(r=>{\n  if (typeof r === 'string' && r.startsWith('http')) return { method:'GET', url: r, headers: {'Authorization': 'Bearer EVIDENCE_API_KEY_PLACEHOLDER'} };\n  return { method:'GET', url: `https://example-evidence-service.local/evidence/${encodeURIComponent(String(r))}`, headers: {'Authorization': 'Bearer EVIDENCE_API_KEY_PLACEHOLDER'} };\n});\nreturn [{ json: { evidenceCalls: calls } }];"
+      },
+      "name": "Evidence",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        1320,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.evidenceCalls[0].url }}",
+        "method": "GET",
+        "responseFormat": "json",
+        "headerParametersJson": "{\"Authorization\":\"Bearer EVIDENCE_API_KEY_PLACEHOLDER\"}"
+      },
+      "name": "EvidenceHTTP",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [
+        1540,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "/* Salesforce: placeholder request to fetch contact and notes by merchant or email. */\nconst m = $json.normalized.merchantId || '';\nconst email = $json.normalized.customer && ($json.normalized.customer.email || $json.normalized.customer.contactEmail) || '';\nconst req = { method: 'GET', url: `https://example-salesforce.local/contacts/search?merchant=${encodeURIComponent(m)}&email=${encodeURIComponent(email)}`, headers: { 'Authorization': 'Bearer SALESFORCE_API_KEY_PLACEHOLDER' } };\nreturn [{ json: { sfRequest: req } }];"
+      },
+      "name": "Salesforce",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        1320,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.sfRequest.url }}",
+        "method": "GET",
+        "responseFormat": "json",
+        "headerParametersJson": "{\"Authorization\":\"Bearer SALESFORCE_API_KEY_PLACEHOLDER\"}"
+      },
+      "name": "SFHTTP",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [
+        1540,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "/* Deduplicate and unify evidence from TxHTTP, EvidenceHTTP, SFHTTP. This node expects upstream nodes to have executed and their outputs to be available. */\nconst inputs = $input.all();\nconst unified = [];\nfunction add(item){ if(!item) return; const key = item.id || item.url || JSON.stringify(item); if(!unified.some(u=>u._key===key)){ item._key = key; unified.push(item); } }\n// collect from TxHTTP\nconst txNode = inputs.find(n=>n.node==='TxHTTP'); if(txNode && txNode.json){ const tx = txNode.json; if(tx && tx.evidence) tx.evidence.forEach(add); }\n// evidence node\nconst evNode = inputs.find(n=>n.node==='EvidenceHTTP'); if(evNode && evNode.json) add(evNode.json);\n// SF notes\nconst sfNode = inputs.find(n=>n.node==='SFHTTP'); if(sfNode && sfNode.json && sfNode.json.notes) sfNode.json.notes.forEach(n=>add({ type: 'note', note: n }));\n$json.evidence_unified = unified;\nreturn items;"
+      },
+      "name": "Dedup",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        1760,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "/* Policy API request to Getaroom or similar service. Use reservationId or merchantId. */\nconst merchant = $json.normalized.merchantId || '';\nconst res = $json.normalized.reservationId || $json.normalized.raw && $json.normalized.raw.reservationId || '';\nconst req = { method: 'GET', url: `https://example-getaroom.local/policy?merchant=${encodeURIComponent(merchant)}&reservation=${encodeURIComponent(res)}`, headers: { 'Authorization': 'Bearer POLICY_API_KEY_PLACEHOLDER' } };\nreturn [{ json: { policyRequest: req } }];"
+      },
+      "name": "Policy",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        1980,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.policyRequest.url }}",
+        "method": "GET",
+        "responseFormat": "json",
+        "headerParametersJson": "{\"Authorization\":\"Bearer POLICY_API_KEY_PLACEHOLDER\"}"
+      },
+      "name": "PolicyHTTP",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [
+        2200,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "/* Cache step: if PolicyHTTP returned policyText, use it; otherwise mark for fallback. */\nconst resp = $json.policyRequest || $json;\nif ($json && $json.policyText) { $json._policyText = $json.policyText; $json._policySource = 'api'; return items; }\n// Some HTTP nodes output as response body; check common keys\nif (resp && resp.body && resp.body.policyText) { $json._policyText = resp.body.policyText; $json._policySource = 'api'; return items; }\n$json._policyText = null; $json._policySource = 'need_fallback';\nreturn items;"
+      },
+      "name": "Cache",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        2420,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "sheetId": "",
+        "range": "policies!A:C",
+        "options": {}
+      },
+      "name": "SheetsPolicies",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 1,
+      "position": [
+        2640,
+        120
+      ],
+      "credentials": {
+        "googleSheetsOAuth2": {
+          "id": "GOOGLE_SHEETS_OAUTH2_PLACEHOLDER",
+          "name": "GoogleSheetsCreds"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "/* Evaluate SheetsPolicies output to find matching policy by merchantId or reservationId. Expects sheets output in $items. If none, continue to Scrape. */\nconst merchant = $json.normalized && $json.normalized.merchantId;\n// n8n Sheets nodes return array of rows; adapt to your shape. This template checks but defaults to fallback.\nif ($json._policyText) return items; // already have\n// Not found in API; try sheets data (left as template)\n$json._policyText = null; $json._policySource = $json._policySource || 'sheets_try';\nreturn items;"
+      },
+      "name": "PolicyCheck",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        2860,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "/* Scrape fallback using headless browser service. Posts policyUrl or constructed url. */\nconst url = $json.normalized && ($json.normalized.policyUrl || `https://example.com/policy/${encodeURIComponent($json.normalized.merchantId||'')}`);\nconst req = { method: 'POST', url: 'https://example-headless-scraper.local/scrape', body: { url }, headers: { 'Authorization': 'Bearer SCRAPER_KEY_PLACEHOLDER', 'Content-Type': 'application/json' } };\nreturn [{ json: { scrapeRequest: req } }];"
+      },
+      "name": "Scrape",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        3080,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.scrapeRequest.url }}",
+        "method": "POST",
+        "jsonParameters": true,
+        "bodyParametersJson": "={{ JSON.stringify($json.scrapeRequest.body) }}",
+        "headerParametersJson": "{\"Authorization\":\"Bearer SCRAPER_KEY_PLACEHOLDER\",\"Content-Type\":\"application/json\"}",
+        "responseFormat": "json"
+      },
+      "name": "ScrapeHTTP",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [
+        3300,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "/* Normalize policy text, compute sha256, prepare policy row for storage. If scrape returned text, use it; otherwise abort. */\nconst body = $json || {};\nconst policyText = body.policyText || body.scrapedText || (body.body && body.body.policyText) || null;\nif (!policyText) { $json._policyStored = false; return items; }\nconst crypto = require('crypto');\nconst hash = crypto.createHash('sha256').update(policyText).digest('hex');\n$json.policyText = policyText; $json.policyHash = hash; $json._policyStored = true;\n$json._policyRow = [ $json.normalized && $json.normalized.merchantId || 'unknown', hash, policyText.slice(0,250) ];\nreturn items;"
+      },
+      "name": "PolicyNormalize",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        3520,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "sheetId": "",
+        "range": "policies!A:C",
+        "options": {
+          "valueInputMode": "RAW"
+        },
+        "rawData": "={{{ [ $json._policyRow ] }}}"
+      },
+      "name": "PolicyStore",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 1,
+      "position": [
+        3740,
+        120
+      ],
+      "credentials": {
+        "googleSheetsOAuth2": {
+          "id": "GOOGLE_SHEETS_OAUTH2_PLACEHOLDER",
+          "name": "GoogleSheetsCreds"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "/* Chunk policy into ~3500 char pieces and prepare chunk rows. */\nconst text = $json.policyText || '';\nconst size = 3500;\nconst chunks = [];\nfor (let i=0;i<text.length;i+=size){ const piece = text.slice(i,i+size); const idx = Math.floor(i/size); const key = `policy_${$json.policyHash}_chunk_${idx}`; chunks.push({ index: idx, key, text: piece }); }\n$json.policyChunks = chunks; $json.policyChunkCount = chunks.length;\n$json._chunkRows = chunks.map(c=>[c.key, c.index, $json.policyHash, c.text]);\nreturn items;"
+      },
+      "name": "Chunk",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        3960,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "sheetId": "",
+        "range": "chunks!A:D",
+        "options": {
+          "valueInputMode": "RAW"
+        },
+        "rawData": "={{{ $json._chunkRows }}}"
+      },
+      "name": "ChunkStore",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 1,
+      "position": [
+        4180,
+        120
+      ],
+      "credentials": {
+        "googleSheetsOAuth2": {
+          "id": "GOOGLE_SHEETS_OAUTH2_PLACEHOLDER",
+          "name": "GoogleSheetsCreds"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "/* Build case_context object WITHOUT full policy text; include chunk keys and metadata. */\nconst norm = $json.normalized || {};\nconst evidence = $json.evidence_unified || [];\nconst policyMeta = { hash: $json.policyHash || null, chunks: ($json.policyChunks || []).map(c=>({ key: c.key, index: c.index })) };\nconst context = {\n  caseId: norm.caseId,\n  txnId: norm.txnId,\n  merchantId: norm.merchantId,\n  amount: norm.amount,\n  currency: norm.currency,\n  disputeReason: norm.disputeReason,\n  timestamps: norm.timestamps,\n  customer: { name: norm.customer && (norm.customer.name || norm.customer.fullName) || null, id: norm.customer && (norm.customer.id || null) },\n  evidenceRefs: evidence.map(e=>({ id: e.id||e._key||null, url: e.url||null, type: e.type||null, meta: e.meta||null })),\n  policy_meta: policyMeta,\n  case_meta: { receivedAt: $json._receivedAt || new Date().toISOString(), sigVerified: $json._sigVerified || false }\n};\n$json.case_context = context;\nreturn items;"
+      },
+      "name": "Context",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        4400,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "/* Prepare LLM prompts: include case_context and attach policy chunk texts inline. In real runs, fetch chunk texts by keys from chunk store; here we use $json.policyChunks if present. */\nconst ctx = $json.case_context || {};\nconst chunks = $json.policyChunks || [];\nconst chunksText = chunks.map(c=>`--- CHUNK ${c.index} KEY:${c.key} ---\\n${c.text || '<MISSING_CHUNK_TEXT>'}`).join('\\n\\n');\nconst systemPrompt = `You are a strict chargeback rebuttal generator. Zero hallucinations. Rely only on provided evidence and policy excerpts. If data is missing, respond with JSON: {\"conclusion\":\"MANUAL_REVIEW_REQUIRED\",\"missing_fields\":[...]} and do NOT invent facts.`;\nconst userPrompt = `Case Context:\\n${JSON.stringify(ctx,null,2)}\\n\\nPolicy Chunks (full text):\\n${chunksText}\\n\\nInstructions:\\n1) Produce a JSON object exactly with keys: rebuttalText (string), evidence_map (array of {evidenceId, excerptOrNote}), conclusion (string: AUTO_SUBMIT or MANUAL_REVIEW_REQUIRED), confidence (number 0-100), missing_fields (array).\\n2) If any essential fields are missing or policy/evidence is insufficient, set conclusion to MANUAL_REVIEW_REQUIRED and list missing_fields.\\n3) Use only the text supplied in policy chunks and evidence mapping; do not hallucinate dates or facts.\\n4) Provide concise, citation-style references to policy chunk keys where used.`;\n$json.llm_system = systemPrompt; $json.llm_user = userPrompt;\nreturn items;"
+      },
+      "name": "Prepare",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        4620,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "/* ModelA request body for HTTP chat completion (GPT-5.0). Using HTTP Request nodes per requirements. */\nconst body = {\n  model: 'gpt-5.0',\n  messages: [ { role: 'system', content: $json.llm_system }, { role: 'user', content: $json.llm_user } ],\n  temperature: 0.0,\n  max_tokens: 2000\n};\nreturn [{ json: { request: { url: 'https://openai.api.internal/v1/chat/completions', method: 'POST', body, headers: { 'Authorization': 'Bearer OPENAI_API_KEY_PLACEHOLDER', 'Content-Type': 'application/json' } }, tag: 'A' } }];"
+      },
+      "name": "ModelA",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        4840,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.request.url }}",
+        "method": "POST",
+        "jsonParameters": true,
+        "bodyParametersJson": "={{ JSON.stringify($json.request.body) }}",
+        "headerParametersJson": "{\"Authorization\":\"Bearer OPENAI_API_KEY_PLACEHOLDER\",\"Content-Type\":\"application/json\"}",
+        "responseFormat": "json"
+      },
+      "name": "ModelAHTTP",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [
+        5060,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "/* ModelB: second independent call with same prompt (could use different temperature/seed if desired). */\nconst body = {\n  model: 'gpt-5.0',\n  messages: [ { role: 'system', content: $json.llm_system }, { role: 'user', content: $json.llm_user } ],\n  temperature: 0.0,\n  max_tokens: 2000\n};\nreturn [{ json: { request: { url: 'https://openai.api.internal/v1/chat/completions', method: 'POST', body, headers: { 'Authorization': 'Bearer OPENAI_API_KEY_PLACEHOLDER', 'Content-Type': 'application/json' } }, tag: 'B' } }];"
+      },
+      "name": "ModelB",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        4840,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.request.url }}",
+        "method": "POST",
+        "jsonParameters": true,
+        "bodyParametersJson": "={{ JSON.stringify($json.request.body) }}",
+        "headerParametersJson": "{\"Authorization\":\"Bearer OPENAI_API_KEY_PLACEHOLDER\",\"Content-Type\":\"application/json\"}",
+        "responseFormat": "json"
+      },
+      "name": "ModelBHTTP",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [
+        5060,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "/* Parse LLM responses from A and B into structured JSON in llmResults.A and llmResults.B. Expect assistant message content to be JSON; fallback to raw. */\nfunction safeParse(text){ try{ return JSON.parse(text); }catch(e){ return { parseError: true, raw: text }; } }\nconst aNode = $input.all().find(n=>n.node==='ModelAHTTP');\nconst bNode = $input.all().find(n=>n.node==='ModelBHTTP');\nconst out = { A: null, B: null };\nif (aNode && aNode.json){ const c = aNode.json.choices && aNode.json.choices[0] && aNode.json.choices[0].message && aNode.json.choices[0].message.content; out.A = safeParse(c || JSON.stringify(aNode.json)); }\nif (bNode && bNode.json){ const c = bNode.json.choices && bNode.json.choices[0] && bNode.json.choices[0].message && bNode.json.choices[0].message.content; out.B = safeParse(c || JSON.stringify(bNode.json)); }\n$json.llmResults = out;\nreturn items;"
+      },
+      "name": "Parse",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        5280,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "/* Verifier LLM: compare A and B using a third GPT call. Request JSON decision. */\nconst system = 'You are a verifier. Compare two JSON rebuttals A and B. Output EXACTLY a JSON object: {\"decision\":\"PICK_A\"|\"PICK_B\"|\"TIE\"|\"MANUAL_REVIEW\",\"reasons\":[...],\"confidence\":number(0-100),\"missing_fields\":[]}';\nconst a = JSON.stringify($json.llmResults && $json.llmResults.A || {});\nconst b = JSON.stringify($json.llmResults && $json.llmResults.B || {});\nconst body = { model: 'gpt-5.0', messages: [ { role: 'system', content: system }, { role: 'user', content: `Compare these rebuttals.\\nA: ${a}\\n\\nB: ${b}\\n\\nBe impartial. If parse errors or hallucinations are detected, return MANUAL_REVIEW.` } ], temperature: 0.0, max_tokens: 800 };\nreturn [{ json: { request: { url: 'https://openai.api.internal/v1/chat/completions', method: 'POST', body, headers: { 'Authorization': 'Bearer OPENAI_API_KEY_PLACEHOLDER', 'Content-Type': 'application/json' } } } }];"
+      },
+      "name": "Verify",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        5500,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.request.url }}",
+        "method": "POST",
+        "jsonParameters": true,
+        "bodyParametersJson": "={{ JSON.stringify($json.request.body) }}",
+        "headerParametersJson": "{\"Authorization\":\"Bearer OPENAI_API_KEY_PLACEHOLDER\",\"Content-Type\":\"application/json\"}",
+        "responseFormat": "json"
+      },
+      "name": "VerifyHTTP",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [
+        5720,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "/* Parse verifier response. Determine route 'manual'|'auto'. Criteria: decision MANUAL_REVIEW OR confidence<70 OR missing_fields non-empty => manual. */\nconst resp = $json || {};\nlet parsed = {};\ntry{ const content = resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content; parsed = content ? JSON.parse(content) : { decision: 'MANUAL_REVIEW', confidence:0 }; }catch(e){ parsed = { decision: 'MANUAL_REVIEW', confidence:0, parseError: e.message }; }\n$json.verifier = parsed;\n$json.verifierRoute = (parsed.decision === 'MANUAL_REVIEW' || (parsed.confidence||0) < 70 || (parsed.missing_fields && parsed.missing_fields.length>0)) ? 'manual' : 'auto';\nreturn items;"
+      },
+      "name": "VerifierParse",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        5940,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "/* Decide which rebuttal to use. If manual route, selected=null. If verifier picks A/B, honor that. If TIE, use deterministic hash of caseId. */\nconst ver = $json.verifier || {};\nif ($json.verifierRoute === 'manual') { $json.selected = null; $json.selectionReason = 'manual_review_required'; return items; }\nlet pick = null;\nif (ver.decision === 'PICK_A') pick = 'A';\nelse if (ver.decision === 'PICK_B') pick = 'B';\nelse {\n  // deterministic hash tie-breaker\n  const crypto = require('crypto');\n  const cid = ($json.case_context && $json.case_context.caseId) || (process.env.DEFAULT_CASE_ID || 'fallback_case');\n  const h = crypto.createHash('sha256').update(cid).digest('hex');\n  const n = parseInt(h.slice(0,8),16);\n  pick = (n % 2 === 0) ? 'A' : 'B';\n}\n$json.selected = pick; $json.selectionReason = `verifier:${ver.decision || 'tie'}`;\nreturn items;"
+      },
+      "name": "Decide",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        6160,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "/* ManualReview branch: prepare row to append to manual review sheet and stop further auto-submission. */\nconst row = [ new Date().toISOString(), $json.case_context && $json.case_context.caseId || null, 'manual_review', JSON.stringify({verifier:$json.verifier, missing:$json.verifier && $json.verifier.missing_fields || []}) ];\n$json._manualRow = row;\nreturn items;"
+      },
+      "name": "ManualReview",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        6380,
+        520
+      ]
+    },
+    {
+      "parameters": {
+        "sheetId": "",
+        "range": "events!A:D",
+        "options": {
+          "valueInputMode": "RAW"
+        },
+        "rawData": "={{{ [ $json._manualRow ] }}}"
+      },
+      "name": "SheetsManual",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 1,
+      "position": [
+        6600,
+        520
+      ],
+      "credentials": {
+        "googleSheetsOAuth2": {
+          "id": "GOOGLE_SHEETS_OAUTH2_PLACEHOLDER",
+          "name": "GoogleSheetsCreds"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "/* Select chosen rebuttal when auto route. Attach chosenRebuttal and metadata for PDF and PSP. */\nif (!$json.selected) { $json._autoReady = false; return items; }\nconst chosen = $json.llmResults && $json.llmResults[$json.selected];\n$json.chosenRebuttal = chosen || null; $json.chosenId = $json.selected; $json._autoReady = true;\nreturn items;"
+      },
+      "name": "Select",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        6380,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "/* PDF HTML generation: build full HTML document with sections and watermark. Uses case_context and chosen rebuttal. */\nconst ctx = $json.case_context || {};\nconst rebuttal = $json.chosenRebuttal || {};\nconst html = `<!doctype html><html><head><meta charset=\"utf-8\"><title>Rebuttal ${ctx.caseId||''}</title><style>body{font-family:Arial,Helvetica,sans-serif;color:#111;margin:30px}h1{font-size:20px}pre{background:#f7f7f7;padding:12px;border-radius:6px} .wm{position:fixed;left:15%;top:40%;font-size:50px;color:rgba(0,0,0,0.03);transform:rotate(-30deg)}</style></head><body><div class=\"wm\">CONFIDENTIAL</div><h1>Chargeback Rebuttal — Case ${ctx.caseId || ''}</h1><p><strong>Merchant:</strong> ${ctx.merchantId || 'N/A'} &nbsp; <strong>Txn:</strong> ${ctx.txnId || 'N/A'} &nbsp; <strong>Amount:</strong> ${ctx.amount || 'N/A'} ${ctx.currency || ''}</p><h2>Summary</h2><pre>${(rebuttal.summary || rebuttal.rebuttalText || 'No summary provided')}</pre><h2>Evidence Mapping</h2><table border=\"1\" cellpadding=\"6\" cellspacing=\"0\"><thead><tr><th>Evidence ID</th><th>Type</th><th>Note</th></tr></thead><tbody>${(ctx.evidenceRefs||[]).map(e=>`<tr><td>${e.id||''}</td><td>${e.type||''}</td><td>${e.meta||''}</td></tr>`).join('')}</tbody></table><h2>Policy References</h2><p>Policy Hash: ${ctx.policy_meta && ctx.policy_meta.hash || 'N/A'}</p><ul>${(ctx.policy_meta && ctx.policy_meta.chunks || []).map(c=>`<li>${c.index} — ${c.key}</li>`).join('')}</ul><h2>Timeline</h2><pre>${JSON.stringify(ctx.timestamps,null,2)}</pre><h2>Rebuttal</h2><pre>${(rebuttal.rebuttalText) ? rebuttal.rebuttalText : JSON.stringify(rebuttal,null,2)}</pre><footer style=\"font-size:12px;color:#666;margin-top:30px\">Generated: ${new Date().toISOString()}</footer></body></html>`;\n$json.pdfHtml = html;\nreturn items;"
+      },
+      "name": "PdfHtml",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        6600,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "binaryPropertyName": "pdf",
+        "options": {}
+      },
+      "name": "PdfGenerate",
+      "type": "n8n-nodes-base.htmlToPdf",
+      "typeVersion": 1,
+      "position": [
+        6820,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "binaryData": "={{$binary.pdf.data}}",
+        "folderId": "root",
+        "fileName": "chargeback_rebuttal_{{$json.case_context && $json.case_context.caseId || $now}}.pdf"
+      },
+      "name": "Drive",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 1,
+      "position": [
+        7040,
+        200
+      ],
+      "credentials": {
+        "googleDriveOAuth2": {
+          "id": "GOOGLE_DRIVE_OAUTH2_PLACEHOLDER",
+          "name": "GoogleDriveCreds"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "/* Build PSP submission body with metadata and Drive link (webViewLink/webContentLink or constructed link). */\nconst driveInfo = $json || {};\nconst fileId = driveInfo.id || (driveInfo.data && driveInfo.data.id) || null;\nconst pdfUrl = driveInfo.webViewLink || driveInfo.webContentLink || (fileId ? `https://drive.google.com/file/d/${fileId}/view` : null);\nconst body = {\n  caseId: $json.case_context && $json.case_context.caseId,\n  txnId: $json.case_context && $json.case_context.txnId,\n  merchantId: $json.case_context && $json.case_context.merchantId,\n  rebuttalId: $json.chosenId || null,\n  rebuttalConfidence: $json.chosenRebuttal && $json.chosenRebuttal.confidence || null,\n  pdfUrl,\n  verifier: $json.verifier || {}\n};\n$json.pspBody = body;\nreturn items;"
+      },
+      "name": "PreparePSP",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        7260,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://psp.example.com/chargeback/submit",
+        "method": "POST",
+        "jsonParameters": true,
+        "bodyParametersJson": "={{ JSON.stringify($json.pspBody) }}",
+        "headerParametersJson": "{\"Authorization\":\"Bearer PSP_API_KEY_PLACEHOLDER\",\"Content-Type\":\"application/json\"}",
+        "responseFormat": "json"
+      },
+      "name": "PSPSubmit",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [
+        7480,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "/* Audit & events: prepare rows for events and auditlog sheets. */\n$json._eventRow = [ new Date().toISOString(), $json.case_context && $json.case_context.caseId || null, 'submitted', JSON.stringify($json.pspBody || {}) ];\n$json._auditRow = [ new Date().toISOString(), $json.case_context && $json.case_context.caseId || null, 'submit_response', JSON.stringify($json || {}) ];\nreturn items;"
+      },
+      "name": "Audit",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        7700,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "sheetId": "",
+        "range": "events!A:D",
+        "options": {
+          "valueInputMode": "RAW"
+        },
+        "rawData": "={{{ [ $json._eventRow ] }}}"
+      },
+      "name": "SheetsEvents",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 1,
+      "position": [
+        7920,
+        120
+      ],
+      "credentials": {
+        "googleSheetsOAuth2": {
+          "id": "GOOGLE_SHEETS_OAUTH2_PLACEHOLDER",
+          "name": "GoogleSheetsCreds"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sheetId": "",
+        "range": "auditlog!A:D",
+        "options": {
+          "valueInputMode": "RAW"
+        },
+        "rawData": "={{{ [ $json._auditRow ] }}}"
+      },
+      "name": "SheetsAudit",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 1,
+      "position": [
+        7920,
+        280
+      ],
+      "credentials": {
+        "googleSheetsOAuth2": {
+          "id": "GOOGLE_SHEETS_OAUTH2_PLACEHOLDER",
+          "name": "GoogleSheetsCreds"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "/* Respond: send safe acknowledgment body back to original webhook caller. DO NOT echo full PII or sensitive content. */\nconst route = $json.verifierRoute || ($json.selected ? 'auto' : 'manual');\nconst ack = { status: 'received', caseId: $json.case_context && $json.case_context.caseId || null, route };\nreturn [{ json: ack }];"
+      },
+      "name": "Respond",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        8140,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "/* Error handler prepares audit row for failures. Use this in catch/error paths. */\nconst err = $json || { message: 'unknown_error' };\n$json._errorRow = [ new Date().toISOString(), $json.case_context && $json.case_context.caseId || 'unknown', 'error', JSON.stringify(err) ];\nreturn items;"
+      },
+      "name": "ErrorHandler",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        8140,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "sheetId": "",
+        "range": "auditlog!A:D",
+        "options": {
+          "valueInputMode": "RAW"
+        },
+        "rawData": "={{{ [ $json._errorRow ] }}}"
+      },
+      "name": "SheetsError",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 1,
+      "position": [
+        8360,
+        420
+      ],
+      "credentials": {
+        "googleSheetsOAuth2": {
+          "id": "GOOGLE_SHEETS_OAUTH2_PLACEHOLDER",
+          "name": "GoogleSheetsCreds"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "/* Logger: simple console log for debugging. */\nconsole.log('Chargeback workflow executed for', $json.case_context && $json.case_context.caseId || 'unknown');\nreturn items;"
+      },
+      "name": "Logger",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        8360,
+        240
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Case",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Case": {
+      "main": [
+        [
+          {
+            "node": "SheetsCases",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Signature",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SheetsCases": {
+      "main": [
+        [
+          {
+            "node": "Signature",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Signature": {
+      "main": [
+        [
+          {
+            "node": "Scrub",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Scrub": {
+      "main": [
+        [
+          {
+            "node": "Validate",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Normalize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate": {
+      "main": [
+        [
+          {
+            "node": "Normalize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize": {
+      "main": [
+        [
+          {
+            "node": "Transaction",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Evidence",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Policy",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Prepare",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Transaction": {
+      "main": [
+        [
+          {
+            "node": "TxHTTP",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "TxHTTP": {
+      "main": [
+        [
+          {
+            "node": "Dedup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evidence": {
+      "main": [
+        [
+          {
+            "node": "EvidenceHTTP",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "EvidenceHTTP": {
+      "main": [
+        [
+          {
+            "node": "Dedup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Salesforce": {
+      "main": [
+        [
+          {
+            "node": "SFHTTP",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SFHTTP": {
+      "main": [
+        [
+          {
+            "node": "Dedup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dedup": {
+      "main": [
+        [
+          {
+            "node": "Context",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Prepare",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Policy": {
+      "main": [
+        [
+          {
+            "node": "PolicyHTTP",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PolicyHTTP": {
+      "main": [
+        [
+          {
+            "node": "Cache",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "PolicyNormalize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cache": {
+      "main": [
+        [
+          {
+            "node": "SheetsPolicies",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Scrape",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SheetsPolicies": {
+      "main": [
+        [
+          {
+            "node": "PolicyCheck",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PolicyCheck": {
+      "main": [
+        [
+          {
+            "node": "Scrape",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "PolicyNormalize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Scrape": {
+      "main": [
+        [
+          {
+            "node": "ScrapeHTTP",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ScrapeHTTP": {
+      "main": [
+        [
+          {
+            "node": "PolicyNormalize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PolicyNormalize": {
+      "main": [
+        [
+          {
+            "node": "PolicyStore",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Chunk",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PolicyStore": {
+      "main": [
+        [
+          {
+            "node": "Chunk",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Chunk": {
+      "main": [
+        [
+          {
+            "node": "ChunkStore",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ChunkStore": {
+      "main": [
+        [
+          {
+            "node": "Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Context": {
+      "main": [
+        [
+          {
+            "node": "Prepare",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare": {
+      "main": [
+        [
+          {
+            "node": "ModelA",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "ModelB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ModelA": {
+      "main": [
+        [
+          {
+            "node": "ModelAHTTP",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ModelAHTTP": {
+      "main": [
+        [
+          {
+            "node": "Parse",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ModelB": {
+      "main": [
+        [
+          {
+            "node": "ModelBHTTP",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ModelBHTTP": {
+      "main": [
+        [
+          {
+            "node": "Parse",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse": {
+      "main": [
+        [
+          {
+            "node": "Verify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify": {
+      "main": [
+        [
+          {
+            "node": "VerifyHTTP",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "VerifyHTTP": {
+      "main": [
+        [
+          {
+            "node": "VerifierParse",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "VerifierParse": {
+      "main": [
+        [
+          {
+            "node": "Decide",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decide": {
+      "main": [
+        [
+          {
+            "node": "Select",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "ManualReview",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ManualReview": {
+      "main": [
+        [
+          {
+            "node": "SheetsManual",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Select": {
+      "main": [
+        [
+          {
+            "node": "PdfHtml",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PdfHtml": {
+      "main": [
+        [
+          {
+            "node": "PdfGenerate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PdfGenerate": {
+      "main": [
+        [
+          {
+            "node": "Drive",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Drive": {
+      "main": [
+        [
+          {
+            "node": "PreparePSP",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PreparePSP": {
+      "main": [
+        [
+          {
+            "node": "PSPSubmit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PSPSubmit": {
+      "main": [
+        [
+          {
+            "node": "Audit",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Audit": {
+      "main": [
+        [
+          {
+            "node": "SheetsEvents",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "SheetsAudit",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond": {
+      "main": [
+        [
+          {
+            "node": "Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ErrorHandler": {
+      "main": [
+        [
+          {
+            "node": "SheetsError",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SheetsError": {
+      "main": [
+        [
+          {
+            "node": "Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {},
+  "staticData": {}
+}
